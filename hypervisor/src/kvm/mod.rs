@@ -32,8 +32,7 @@ use anyhow::anyhow;
 #[cfg(feature = "sev_snp")]
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
-#[cfg(feature = "sev_snp")]
-use log::debug;
+use log::{debug, info};
 #[cfg(target_arch = "x86_64")]
 use log::warn;
 use vmm_sys_util::errno;
@@ -865,6 +864,7 @@ impl vm::Vm for KvmVm {
         let xsave_size = self.fd.check_extension_int(Cap::Xsave2);
         let vcpu = KvmVcpu {
             fd,
+            vcpu_id: id,
             #[cfg(target_arch = "x86_64")]
             msrs: self.msrs.clone(),
             vm_ops,
@@ -1747,6 +1747,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 /// Vcpu struct for KVM
 pub struct KvmVcpu {
     fd: VcpuFd,
+    vcpu_id: u32,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     vm_ops: Option<Arc<dyn vm::VmOps>>,
@@ -2338,10 +2339,49 @@ impl cpu::Vcpu for KvmVcpu {
     /// Triggers the running of the current virtual CPU returning an exit reason.
     ///
     fn run(&mut self) -> std::result::Result<cpu::VmExit, cpu::HypervisorCpuError> {
+        #[cfg(target_arch = "x86_64")]
+        fn describe_pio(addr: u16) -> &'static str {
+            match addr {
+                0x20 | 0x21 => "PIC1 (legacy interrupt controller)",
+                0xa0 | 0xa1 => "PIC2 (legacy interrupt controller)",
+                0x40..=0x43 => "PIT (legacy timer)",
+                0x60 | 0x64 => "PS/2 keyboard/mouse controller",
+                0x70 | 0x71 => "CMOS/RTC (real-time clock)",
+                0x80 => "debug port (POST code)",
+                0xcf8..=0xcff => "PCI config space",
+                0x3f8..=0x3ff => "COM1 serial port",
+                0x2f8..=0x2ff => "COM2 serial port",
+                0x3e8..=0x3ef => "COM3 serial port",
+                0x2e8..=0x2ef => "COM4 serial port",
+                0x608..=0x60b => "ACPI PM timer",
+                0x600..=0x607 => "ACPI PM control",
+                _ => "unknown",
+            }
+        }
+
+        fn describe_mmio(addr: u64) -> &'static str {
+            match addr {
+                0xfec00000..=0xfec003ff => "IOAPIC (I/O interrupt controller)",
+                0xfee00000..=0xfee003ff => "LAPIC (local interrupt controller)",
+                0xe8000000..=0xe80fffff => "PCI ECAM (PCIe config space)",
+                // virtio-blk BAR (from PCI enumeration: BAR 0 at 0xe7f80000)
+                0xe7f80000..=0xe7f83fff => "virtio-blk common/ISR/notify",
+                0xe7f84000..=0xe7f87fff => "virtio-blk device config",
+                0xe7f88000..=0xe7f8bfff => "virtio-blk notify/doorbell",
+                // virtio-rng BAR (from PCI enumeration: BAR 0 at high address)
+                0x3fffff800000..=0x3fffff803fff => "virtio-rng common/ISR/notify",
+                0x3fffff808000..=0x3fffff80bfff => "virtio-rng notify/doorbell",
+                // MSI-X table regions
+                0x3ffffffee000..=0x3ffffffeefff => "MSI-X table/PBA",
+                _ => "unknown",
+            }
+        }
+
         match self.fd.run() {
             Ok(run) => match run {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
+                    info!("[vmexit] vcpu={} IoIn addr={:#x} ({}) len={}", self.vcpu_id, addr, describe_pio(addr), data.len());
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .pio_read(addr.into(), data)
@@ -2353,6 +2393,20 @@ impl cpu::Vcpu for KvmVcpu {
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoOut(addr, data) => {
+                    if addr == 0x3f8 && data.len() == 1 {
+                        let ch = data[0];
+                        if ch.is_ascii_graphic() || ch == b' ' {
+                            info!("[vmexit] vcpu={} IoOut addr={:#x} (COM1 serial port) char='{}'", self.vcpu_id, addr, ch as char);
+                        } else if ch == b'\n' {
+                            info!("[vmexit] vcpu={} IoOut addr={:#x} (COM1 serial port) char='\\n'", self.vcpu_id, addr);
+                        } else if ch == b'\r' {
+                            info!("[vmexit] vcpu={} IoOut addr={:#x} (COM1 serial port) char='\\r'", self.vcpu_id, addr);
+                        } else {
+                            info!("[vmexit] vcpu={} IoOut addr={:#x} (COM1 serial port) byte={:#04x}", self.vcpu_id, addr, ch);
+                        }
+                    } else {
+                        info!("[vmexit] vcpu={} IoOut addr={:#x} ({}) len={} data={:02x?}", self.vcpu_id, addr, describe_pio(addr), data.len(), &data[..data.len().min(8)]);
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .pio_write(addr.into(), data)
@@ -2363,14 +2417,19 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
                 #[cfg(target_arch = "x86_64")]
-                VcpuExit::IoapicEoi(vector) => Ok(cpu::VmExit::IoapicEoi(vector)),
+                VcpuExit::IoapicEoi(vector) => {
+                    info!("[vmexit] vcpu={} IoapicEoi vector={}", self.vcpu_id, vector);
+                    Ok(cpu::VmExit::IoapicEoi(vector))
+                }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::Shutdown => {
+                    info!("[vmexit] vcpu={} Shutdown (triple-fault)", self.vcpu_id);
                     error!("Guest likely triple-faulted");
                     Ok(cpu::VmExit::Reset)
                 }
                 // Practically unlikely, as KVM emulates the LAPIC and therefore HLT
                 VcpuExit::Hlt => {
+                    info!("[vmexit] vcpu={} Hlt", self.vcpu_id);
                     error!("Received a HLT exit but KVM should handle this in kernel space");
                     Ok(cpu::VmExit::Reset)
                 }
@@ -2392,6 +2451,7 @@ impl cpu::Vcpu for KvmVcpu {
                 }
 
                 VcpuExit::MmioRead(addr, data) => {
+                    info!("[vmexit] vcpu={} MmioRead addr={:#x} ({}) len={}", self.vcpu_id, addr, describe_mmio(addr), data.len());
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .mmio_read(addr, data)
@@ -2402,6 +2462,7 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    info!("[vmexit] vcpu={} MmioWrite addr={:#x} ({}) len={} data={:02x?}", self.vcpu_id, addr, describe_mmio(addr), data.len(), &data[..data.len().min(8)]);
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .mmio_write(addr, data)
@@ -2411,10 +2472,16 @@ impl cpu::Vcpu for KvmVcpu {
 
                     Ok(cpu::VmExit::Ignore)
                 }
-                VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
+                VcpuExit::Hyperv => {
+                    info!("[vmexit] vcpu={} Hyperv", self.vcpu_id);
+                    Ok(cpu::VmExit::Hyperv)
+                }
                 #[cfg(feature = "tdx")]
                 VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
-                VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
+                VcpuExit::Debug(_) => {
+                    info!("[vmexit] vcpu={} Debug", self.vcpu_id);
+                    Ok(cpu::VmExit::Debug)
+                }
                 #[cfg(feature = "sev_snp")]
                 VcpuExit::Hypercall(hypercall) => {
                     // https://docs.kernel.org/virt/kvm/x86/hypercalls.html#kvm-hc-map-gpa-range
@@ -2496,13 +2563,19 @@ impl cpu::Vcpu for KvmVcpu {
                         .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
                 }
 
-                r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                    "Unexpected exit reason on vcpu run: {r:?}"
-                ))),
+                r => {
+                    info!("[vmexit] vcpu={} Unknown exit={:?}", self.vcpu_id, r);
+                    Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "Unexpected exit reason on vcpu run: {r:?}"
+                    )))
+                }
             },
 
             Err(ref e) => match e.errno() {
-                libc::EAGAIN | libc::EINTR => Ok(cpu::VmExit::Ignore),
+                libc::EAGAIN | libc::EINTR => {
+                    info!("[vmexit] vcpu={} Interrupted (EAGAIN/EINTR)", self.vcpu_id);
+                    Ok(cpu::VmExit::Ignore)
+                }
                 _ => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                     "VCPU error {e:?}"
                 ))),
