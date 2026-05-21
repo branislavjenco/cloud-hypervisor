@@ -101,11 +101,24 @@ between guest and host before trying to control any of them.
   - 144 MmioRead (IOAPIC, virtio device setup)
 - Confirmed: no RDTSC/RDRAND/MSR exits yet (traps not enabled)
 
-### Step 2: Control all nondeterminism sources (single vCPU)
+### Step 2: Docker image → VM rootfs pipeline
+
+Get arbitrary Docker images running in the VM. This gives us a large library
+of real-world binaries to test against for every subsequent step.
+
+**TODO:**
+- [ ] Pull Docker image layers (via skopeo, crane, or custom code)
+- [ ] Untar layers into an ext4 disk image
+- [ ] Write a minimal init that sets up env vars and execs the entrypoint
+- [ ] Wire up: `tool run <image> --seed=N` boots the VM with that rootfs
+- [ ] Test with a variety of images: hello-world, alpine, nginx, redis, postgres
+
+### Step 3: Control all nondeterminism sources (single vCPU)
 
 Keep using 1 vCPU — no scheduling problem yet. Make every source of
 nondeterminism deterministic, one at a time. Test each by running twice with
-the same config and diffing the output.
+the same config and diffing the output. Having Docker support means we can
+test each trap against many different real-world binaries.
 
 **TODO:**
 - [ ] Disable networking (don't add virtio-net — already the case)
@@ -115,8 +128,9 @@ the same config and diffing the output.
 - [ ] Control clock: fixed TSC frequency, synthetic APIC timer
 - [ ] Seed guest kernel RNG (`rng_seed=` kernel parameter)
 - [ ] Verify: run same image twice, diff all output — must be identical
+- [ ] Test across many Docker images to catch edge cases
 
-### Step 3: Deterministic vCPU scheduler
+### Step 4: Deterministic vCPU scheduler
 
 Add multiple vCPUs. Build a deterministic scheduler. This is the core of
 the project — everything else is plumbing.
@@ -155,16 +169,6 @@ loop {
 - [ ] Handle HLT (guest idle) — skip to next runnable vCPU
 - [ ] Add virtual timer for preemption of long compute slices
 - [ ] (Later) PMU-based branch counting for instruction-level precision
-
-### Step 4: Docker image → VM rootfs pipeline
-
-Unpack Docker images into a rootfs that the VM can boot.
-
-**TODO:**
-- [ ] Pull Docker image layers (via skopeo, crane, or custom code)
-- [ ] Untar layers into an ext4 disk image
-- [ ] Write a minimal init that sets up env vars and execs the entrypoint
-- [ ] Wire up: `tool run <image> --seed=N` boots the VM with that rootfs
 
 ### Step 5: Testing determinism
 
