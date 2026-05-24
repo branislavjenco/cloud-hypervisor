@@ -6,7 +6,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
 
 use acpi_tables::{Aml, AmlSink, aml};
 use log::{error, info, warn};
@@ -219,14 +218,16 @@ impl Aml for AcpiGedDevice {
 }
 
 pub struct AcpiPmTimerDevice {
-    start: Instant,
+    /// Deterministic counter: increments by a fixed number of PM-timer ticks
+    /// per read. Real PM timer runs at 3,579,545 Hz. We advance by 1000 ticks
+    /// per read (~280µs of virtual time), which is a plausible polling interval
+    /// and keeps the guest clock ticking forward without any real-time source.
+    counter: u32,
 }
 
 impl AcpiPmTimerDevice {
     pub fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
+        Self { counter: 0 }
     }
 }
 
@@ -242,16 +243,16 @@ impl BusDevice for AcpiPmTimerDevice {
             warn!("Invalid sized read of PM timer: {}", data.len());
             return;
         }
-        let now = Instant::now();
-        let since = now.duration_since(self.start);
-        let nanos = since.as_nanos();
-
-        const PM_TIMER_FREQUENCY_HZ: u128 = 3_579_545;
-        const NANOS_PER_SECOND: u128 = 1_000_000_000;
-
-        let counter = (nanos * PM_TIMER_FREQUENCY_HZ) / NANOS_PER_SECOND;
-        let counter: u32 = (counter & 0xffff_ffff) as u32;
-
-        data.copy_from_slice(&counter.to_le_bytes());
+        // Advance by a fixed amount each read so the guest always sees a
+        // monotonically increasing, deterministic clock.
+        // 1 tick per read keeps increments small enough that the kernel's
+        // calibration loops (which busy-poll the timer expecting real-time
+        // to pass between reads) converge correctly. With a large increment
+        // the kernel miscomputes loops_per_jiffy and delay functions break.
+        const TICKS_PER_READ: u32 = 1;
+        self.counter = self.counter.wrapping_add(TICKS_PER_READ);
+        // The ACPI PM timer is 24-bit on most systems (bit 23 is the MSB).
+        // Mask to 32 bits; the kernel handles wrap-around correctly.
+        data.copy_from_slice(&self.counter.to_le_bytes());
     }
 }
