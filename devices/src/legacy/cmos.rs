@@ -7,12 +7,9 @@
 use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::{mem, thread};
+use std::thread;
 
-// https://github.com/rust-lang/libc/issues/1848
-#[cfg_attr(target_env = "musl", allow(deprecated))]
-use libc::time_t;
-use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
+// libc time functions are no longer needed; RTC is fixed to a constant epoch.
 use log::{info, warn};
 use vm_device::BusDevice;
 use vmm_sys_util::eventfd::EventFd;
@@ -110,54 +107,30 @@ impl BusDevice for Cmos {
         data[0] = match offset {
             INDEX_OFFSET => self.index,
             DATA_OFFSET => {
-                let seconds;
-                let minutes;
-                let hours;
-                let week_day;
-                let day;
-                let month;
-                let year;
-                // SAFETY: The clock_gettime and gmtime_r calls are safe as long as the structs they are
-                // given are large enough, and neither of them fail. It is safe to zero initialize
-                // the tm and timespec struct because it contains only plain data.
-                let update_in_progress = unsafe {
-                    let mut timespec: timespec = mem::zeroed();
-                    clock_gettime(CLOCK_REALTIME, &raw mut timespec);
-
-                    // https://github.com/rust-lang/libc/issues/1848
-                    #[cfg_attr(target_env = "musl", allow(deprecated))]
-                    let now: time_t = timespec.tv_sec;
-                    let mut tm: tm = mem::zeroed();
-                    gmtime_r(&now, &raw mut tm);
-
-                    // The following lines of code are safe but depend on tm being in scope.
-                    seconds = tm.tm_sec;
-                    minutes = tm.tm_min;
-                    hours = tm.tm_hour;
-                    week_day = tm.tm_wday + 1;
-                    day = tm.tm_mday;
-                    month = tm.tm_mon + 1;
-                    year = tm.tm_year;
-
-                    // Update in Progress bit held for last 224us of each second
-                    const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
-                    const UIP_HOLD_LENGTH: i64 = 8 * NANOSECONDS_PER_SECOND / 32768;
-                    timespec.tv_nsec >= (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH)
-                };
+                // Determinism: RTC is fixed to 2024-01-01 00:00:00 UTC (Monday).
+                // year=124 (years since 1900), month=1, day=1, wday=2 (Monday),
+                // hours=0, minutes=0, seconds=0.
+                const SECONDS: i32 = 0;
+                const MINUTES: i32 = 0;
+                const HOURS: i32 = 0;
+                const WEEK_DAY: i32 = 2; // Monday (1=Sunday, 2=Monday, ...)
+                const DAY: i32 = 1;
+                const MONTH: i32 = 1;
+                const YEAR: i32 = 124; // years since 1900 → 2024
+                const CENTURY: i32 = 20;
                 match self.index {
-                    0x00 => to_bcd(seconds as u8),
-                    0x02 => to_bcd(minutes as u8),
-                    0x04 => to_bcd(hours as u8),
-                    0x06 => to_bcd(week_day as u8),
-                    0x07 => to_bcd(day as u8),
-                    0x08 => to_bcd(month as u8),
-                    0x09 => to_bcd((year % 100) as u8),
-                    // Bit 5 for 32kHz clock. Bit 7 for Update in Progress
-                    0x0a => (1 << 5) | ((update_in_progress as u8) << 7),
-                    // Bit 0-6 are reserved and must be 0.
-                    // Bit 7 must be 1 (CMOS has power)
+                    0x00 => to_bcd(SECONDS as u8),
+                    0x02 => to_bcd(MINUTES as u8),
+                    0x04 => to_bcd(HOURS as u8),
+                    0x06 => to_bcd(WEEK_DAY as u8),
+                    0x07 => to_bcd(DAY as u8),
+                    0x08 => to_bcd(MONTH as u8),
+                    0x09 => to_bcd((YEAR % 100) as u8),
+                    // Bit 5 for 32kHz clock. Bit 7: UIP always 0 (never updating).
+                    0x0a => 1 << 5,
+                    // Bit 0-6 reserved, must be 0. Bit 7 must be 1 (CMOS has power).
                     0x0d => 1 << 7,
-                    0x32 => to_bcd(((year + 1900) / 100) as u8),
+                    0x32 => to_bcd(CENTURY as u8),
                     _ => {
                         // self.index is always guaranteed to be in range via INDEX_MASK.
                         self.data[(self.index & INDEX_MASK) as usize]
