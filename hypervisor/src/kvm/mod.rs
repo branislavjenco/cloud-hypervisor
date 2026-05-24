@@ -2381,7 +2381,11 @@ impl cpu::Vcpu for KvmVcpu {
             Ok(run) => match run {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
-                    info!("[vmexit] vcpu={} IoIn addr={:#x} ({}) len={}", self.vcpu_id, addr, describe_pio(addr), data.len());
+                    // Skip logging PM timer reads — they are deterministic by
+                    // construction and occur ~100k times per boot (too noisy).
+                    if addr < 0x608 || addr > 0x60b {
+                        info!("[vmexit] vcpu={} IoIn addr={:#x} ({}) len={}", self.vcpu_id, addr, describe_pio(addr), data.len());
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .pio_read(addr.into(), data)
