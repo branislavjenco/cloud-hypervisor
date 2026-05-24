@@ -59,6 +59,17 @@ clock_gettime skip the kernel entirely. For images we control, these are
 workarounds. For arbitrary images, they're showstoppers. The hypervisor
 boundary is the only complete interception point.
 
+## Milestones
+
+1. **Single-vCPU determinism.** Docker image → initramfs → boot → run → identical
+   output on two runs with the same seed. All nondeterminism sources controlled
+   except thread scheduling (moot with 1 vCPU). (Steps 0–3)
+
+2. **Multi-vCPU deterministic scheduling.** Add multiple vCPUs with a seeded
+   deterministic scheduler. `tool run redis --seed=42` produces identical output
+   every time, even with concurrent threads. Different seeds explore different
+   interleavings. (Steps 4–5)
+
 ## Implementation plan
 
 ### Step 0: Familiarize with Cloud Hypervisor ✅
@@ -101,17 +112,29 @@ between guest and host before trying to control any of them.
   - 144 MmioRead (IOAPIC, virtio device setup)
 - Confirmed: no RDTSC/RDRAND/MSR exits yet (traps not enabled)
 
-### Step 2: Docker image → VM rootfs pipeline
+### Step 2: Docker image → VM rootfs pipeline ✅
 
 Get arbitrary Docker images running in the VM. This gives us a large library
 of real-world binaries to test against for every subsequent step.
 
-**TODO:**
-- [ ] Pull Docker image layers (via skopeo, crane, or custom code)
-- [ ] Untar layers into an ext4 disk image
-- [ ] Write a minimal init that sets up env vars and execs the entrypoint
-- [ ] Wire up: `tool run <image> --seed=N` boots the VM with that rootfs
-- [ ] Test with a variety of images: hello-world, alpine, nginx, redis, postgres
+**Done:**
+- Built a static init binary (`tool/init.c`, compiled with musl) that:
+  - Opens /dev/console for stdio
+  - Mounts proc, sysfs, tmpfs, creates /dev/fd symlinks and /dev/shm
+  - Reads entrypoint/env/workdir from `/etc/det/config`
+  - Runs entrypoint as child, waits, prints `EXIT:<code>`, powers off
+- Built `tool/run.sh` shell script that:
+  1. `docker create` + `docker export` → tarball
+  2. Extracts into initramfs dir, injects init binary + config
+  3. Converts to cpio archive
+  4. Calculates memory (3x initramfs + 512MB headroom)
+  5. Boots modified cloud-hypervisor with kernel + initramfs
+- Tested with:
+  - `hello-world` — EXIT:0, prints message ✅
+  - `alpine-echo` (alpine + `echo hello from alpine`) — EXIT:0 ✅
+  - `redis` — starts, "Ready to accept connections" ✅
+  - `postgres` (no password) — EXIT:1, correct error ✅
+  - `postgres` (with POSTGRES_PASSWORD) — initializes DB, accepts connections ✅
 
 ### Step 3: Control all nondeterminism sources (single vCPU)
 
@@ -120,15 +143,218 @@ nondeterminism deterministic, one at a time. Test each by running twice with
 the same config and diffing the output. Having Docker support means we can
 test each trap against many different real-world binaries.
 
-**TODO:**
-- [ ] Disable networking (don't add virtio-net — already the case)
-- [ ] Disable ASLR (boot with `nokaslr`, `randomize_va_space=0`)
-- [ ] Trap RDTSC: set VM exit flag in VMCS, return synthetic monotonic value
-- [ ] Trap RDRAND/RDSEED: trap instruction, return seeded PRNG value
-- [ ] Control clock: fixed TSC frequency, synthetic APIC timer
-- [ ] Seed guest kernel RNG (`rng_seed=` kernel parameter)
-- [ ] Verify: run same image twice, diff all output — must be identical
-- [ ] Test across many Docker images to catch edge cases
+**Decisions:**
+- **RDTSC:** KVM doesn't expose RDTSC trapping to userspace — the guest reads
+  the virtual TSC directly and KVM handles it in-kernel. We can't intercept it.
+  Instead, we steer the guest away from TSC entirely: force the kernel to use
+  the ACPI PM timer as its clocksource (`clocksource=acpi_pm tsc=unstable`),
+  and clear the invariant TSC CPUID bit so the kernel doesn't trust the TSC.
+  Userspace RDTSC remains a known gap (most Docker images don't call it directly).
+- **RDRAND/RDSEED:** Clear the CPUID bits so the guest thinks the CPU doesn't
+  support these instructions. Guest kernel falls back to software RNG — this
+  is fine and actually helps determinism. No instruction emulation needed.
+- **ACPI PM timer:** Currently returns real wall-clock time via `Instant::now()`.
+  Replace with a deterministic counter that increments by a fixed amount per
+  read. Since this becomes the guest's sole time source, all time-dependent
+  behavior flows through it.
+- **RTC (Real-Time Clock):** Ports `0x70`/`0x71`. Returns host date/time.
+  Programs calling `date`, `time()`, or logging with timestamps will differ
+  between runs. Fix by setting the RTC to a fixed epoch (e.g. 2024-01-01
+  00:00:00 UTC) every boot.
+- **kvmclock:** A paravirtualized clocksource Linux prefers over both TSC and
+  PM timer when running under KVM. Reads a shared memory page, no VM exit.
+  The `clocksource=acpi_pm` cmdline overrides it, but we should also clear
+  the KVM paravirt clock CPUID bits so it's not even an option.
+- **Interrupt timing:** Timer interrupts (LAPIC timer, PIT) fire based on real
+  time. KVM manages the LAPIC in-kernel. When exactly an interrupt arrives
+  relative to guest execution varies per run — the point in the guest's
+  instruction stream where the interrupt is delivered depends on when the
+  previous VM exit occurred, which depends on real time. This is the hardest
+  remaining source of nondeterminism for single-vCPU. May need to disable
+  LAPIC timer and rely solely on our deterministic PM timer.
+- **Kernel entropy:** Even without RDRAND, the kernel gathers entropy from
+  interrupt timing jitter. If interrupt timing is nondeterministic,
+  `/dev/urandom` output could still vary. Controlling interrupt timing
+  fixes this transitively.
+- **Kernel RNG:** Don't explicitly seed. Once time sources and interrupts are
+  controlled, the kernel's entropy sources are deterministic.
+- **Seed passing:** Whatever is simplest. Probably an env var or kernel cmdline
+  param that cloud-hypervisor reads at startup.
+- **Success criteria:** Run same image twice, diff the full sequence of VM exits
+  (not just serial output). Any nondeterminism in interrupt timing, I/O port
+  access patterns, etc. must show up.
+
+**Test scheme:**
+
+A small custom Docker image that actively exercises every nondeterminism source:
+
+```dockerfile
+FROM alpine
+RUN apk add --no-cache util-linux
+COPY test.sh /test.sh
+CMD ["/test.sh"]
+```
+
+```sh
+#!/bin/sh
+echo "=== RTC/time ==="
+date
+
+echo "=== /dev/urandom ==="
+dd if=/dev/urandom bs=32 count=1 2>/dev/null | hexdump -C
+
+echo "=== ASLR (stack address) ==="
+cat /proc/self/maps | grep stack
+
+echo "=== KASLR (kernel text) ==="
+grep ' T _text' /proc/kallsyms 2>/dev/null || echo "(not accessible)"
+
+echo "=== clock_gettime ==="
+cat /proc/uptime
+```
+
+Each section maps directly to a subtask below. The test script is
+`tool/det-test`. Run it after each subtask; results land in
+`tool/det-test-results/`.
+
+**Baseline (before any fixes):** recorded before implementation started.
+```
+✗ Serial output DIFFERS   (RTC date, uptime, /dev/urandom, ASLR stack addr)
+✓ VM exit sequence is identical
+```
+
+**Current state (after subtasks 1–7):**
+```
+✓ RTC/time identical     (Mon Jan  1 00:00:00 UTC 2024)
+✓ uptime identical       (0.00 0.00)
+✗ /dev/urandom differs   (entropy seeded from interrupt jitter via virtio-rng)
+✓ ASLR stack addr identical
+✓ KASLR text addr identical
+✓ clocksource identical  (acpi_pm)
+✓ VM exit sequence identical (102,584 exits each, 164 lines differ — all
+  virtio-rng data + serial chars from /dev/urandom hexdump)
+```
+
+Every subtask below should make the serial diff shorter and must never make
+the VM exit diff worse.
+
+---
+
+**Subtask 1 — Networking already disabled ✅**
+- No virtio-net device added. Confirmed already the case.
+
+---
+
+**Subtask 2 — Disable ASLR ✅**
+- Added `nokaslr` to kernel cmdline in `tool/run.sh` and `tool/det-test`.
+- `tool/init.c` writes `0` to `/proc/sys/kernel/randomize_va_space` before exec.
+- Result: `[stack]` address and `_text` KASLR address are now identical between runs.
+
+---
+
+**Subtask 3 — Disable kvmclock CPUID bits ✅**
+- Cleared `KVM_FEATURE_CLOCKSOURCE`, `KVM_FEATURE_CLOCKSOURCE2`, and
+  `KVM_FEATURE_CLOCKSOURCE_STABLE` bits from leaf `0x4000_0001` EAX in
+  `arch/src/x86_64/mod.rs` (unconditionally, not just for TDX).
+- Result: `=== clocksource ===` never shows `kvm-clock`; only `acpi_pm` appears.
+
+---
+
+**Subtask 4 — Clear invariant TSC CPUID bit + force ACPI PM timer ✅**
+- Cleared invariant TSC bit (leaf `0x8000_0007`, EDX bit 8) in
+  `arch/src/x86_64/mod.rs`.
+- Added `clocksource=acpi_pm tsc=unstable` to kernel cmdline.
+- Result: `=== clocksource ===` shows `acpi_pm` only; `=== available clocksources ===`
+  shows only `acpi_pm` (TSC and kvm-clock gone).
+
+---
+
+**Subtask 5 — Clear RDRAND/RDSEED CPUID bits ✅**
+- Cleared RDRAND (leaf `0x1`, ECX bit 30) and RDSEED (leaf `0x7`, EBX bit 18)
+  in `arch/src/x86_64/mod.rs`.
+- Guest kernel falls back to software RNG. Direct hardware randomness is gone.
+
+---
+
+**Subtask 6 — Fix RTC to a constant epoch ✅**
+- Replaced `clock_gettime`/`gmtime_r` in `devices/src/legacy/cmos.rs` with
+  hardcoded constants: 2024-01-01 00:00:00 UTC (Monday).
+- Result: `=== RTC/time ===` base epoch is fixed. The displayed time is
+  `epoch + uptime`, so it still varies until uptime is deterministic.
+
+---
+
+**Subtask 7 — Make ACPI PM timer deterministic ✅ (partial)**
+- Replaced `Instant::now()` in `devices/src/acpi.rs` with a counter that
+  increments by 1 tick per read (~0.28µs of virtual time per read).
+- PM timer no longer reads real wall-clock time.
+- Also suppressed PM timer reads from the vmexit log (they are deterministic
+  by construction and were generating ~100k log lines per boot, stalling the VM
+  when `-vvv` logging was active).
+- **Remaining issue:** uptime still varies between runs. See Subtask 8.
+
+---
+
+**Subtask 8 — Fix uptime/interrupt timing nondeterminism ⬅ TODO**
+
+This is the last remaining source of nondeterminism. Current diff:
+```
+✓ RTC/time identical   (Mon Jan  1 00:00:00 UTC 2024)
+✓ uptime identical     (0.00 0.00)
+✗ /dev/urandom differs  (entropy seeded from interrupt jitter)
+✓ ASLR stack addr identical
+✓ KASLR text addr identical
+✓ clocksource identical (acpi_pm)
+✓ VM exit sequence — needs verification with fixed det-test
+```
+
+**Root cause:** interrupt timing jitter. The LAPIC timer fires based on real
+wall-clock time (KVM manages it in-kernel). Each interrupt arrives at a
+slightly different point in the guest's instruction stream depending on host
+scheduling. This jitter feeds the kernel entropy pool, making `/dev/urandom`
+output nondeterministic.
+
+With TICKS_PER_READ=1, uptime and RTC are now deterministic (both show
+0.00 / epoch). The only remaining diff is `/dev/urandom`.
+
+**Approach:** the LAPIC timer fires interrupts based on real wall-clock time
+(KVM manages it in-kernel). Each interrupt fires at a slightly different point
+in the guest's instruction stream depending on host scheduling. Options:
+
+1. **Disable the LAPIC timer entirely.** Pass `nolapic` or `lapic=notimer` to
+   the kernel so it falls back to the PIT or PM timer for timekeeping. Fewer
+   interrupt sources = less jitter.
+2. **Disable the PIT.** Eliminate another real-time interrupt source.
+3. **Use `nohz=off` + `highres=off`.** Forces the kernel into periodic-tick
+   mode with a fixed tick rate, reducing the impact of variable interrupt timing.
+4. **Accept non-deterministic uptime, strip it from the test.** If only the
+   displayed time/uptime varies (and nothing else), we could declare
+   determinism achieved for all *user-visible outputs* and treat uptime as a
+   known non-deterministic kernel internal. This is a weaker but pragmatic goal.
+
+Try options in order. Run `./det-test` after each attempt.
+Goal: both diffs empty.
+
+---
+
+**Subtask 9 — Final verification**
+- Run `./det-test` one last time.
+- Both diffs must be empty:
+  ```
+  ✓ Serial output is identical
+  ✓ VM exit sequence is identical
+  ```
+- Then test with a second Docker image (e.g. `alpine` with `echo hello`) to
+  confirm nothing is image-specific.
+
+---
+
+**After each subtask, the rule is:**
+1. Run `./det-test`.
+2. At least one diff line that previously appeared must now be gone, OR the
+   subtask was a prerequisite with no direct diff effect (subtasks 1, 3, 5).
+3. No diff line that was previously identical must now differ.
+4. The VM exit diff must remain empty throughout.
 
 ### Step 4: Deterministic vCPU scheduler
 
@@ -165,8 +391,13 @@ loop {
 
 **TODO:**
 - [ ] Add second vCPU, implement round-robin at VM exit boundaries
+      **Open question:** Single host thread calling KVM_RUN on each vCPU sequentially
+      (option b) seems simpler for determinism, but need to verify KVM allows calling
+      KVM_RUN for different vCPUs from one thread. Alternative is multi-thread with
+      barriers (option a).
 - [ ] Make scheduling order deterministic from a seed
-- [ ] Handle HLT (guest idle) — skip to next runnable vCPU
+- [ ] Handle HLT (guest idle) — skip to next runnable vCPU. When all vCPUs are
+      halted, advance virtual clock to next timer tick and inject interrupt.
 - [ ] Add virtual timer for preemption of long compute slices
 - [ ] (Later) PMU-based branch counting for instruction-level precision
 
@@ -203,15 +434,19 @@ anything differs, there's a nondeterminism leak.
 
 | Source | Mechanism | Difficulty |
 |--------|-----------|------------|
-| RDTSC | Trap via VMCS, return synthetic value | Easy |
-| RDRAND/RDSEED | Trap instruction, return seeded PRNG | Easy |
-| clock_gettime/vDSO | Guest gets time from virtual TSC we control | Easy |
-| /dev/urandom | Guest kernel seeds from RDRAND + TSC (controlled) | Free |
-| ASLR | Kernel boot param `randomize_va_space=0` | Easy |
-| Thread scheduling | Deterministic vCPU scheduler | Hard |
-| Interrupt timing | Inject at deterministic virtual time | Moderate |
+| RDTSC | Can't trap via KVM. Steer guest to PM timer instead. Known gap for userspace. | Moderate |
+| RDRAND/RDSEED | Clear CPUID bits, guest thinks CPU doesn't support them | Easy |
+| clock_gettime/vDSO | Guest uses PM timer clocksource (we control it) | Easy |
+| ACPI PM timer | Replace `Instant::now()` with deterministic counter | Easy |
+| RTC | Fix to constant epoch (2024-01-01 00:00:00 UTC) | Easy |
+| kvmclock | Clear KVM paravirt clock CPUID bits | Easy |
+| /dev/urandom | Deterministic once interrupt timing + RDRAND controlled | Free |
+| ASLR (userspace) | init writes `randomize_va_space=0` to procfs | Easy |
+| KASLR (kernel) | `nokaslr` boot param | Easy |
+| Thread scheduling | Deterministic vCPU scheduler (Step 4) | Hard |
+| Interrupt timing | LAPIC timer fires based on real time. Hardest single-vCPU source. | Hard |
 | Disk I/O ordering | Single queue, deterministic with single vCPU | Easy |
-| Network | Disabled entirely | Free |
+| Network | Disabled entirely (no virtio-net) | Free |
 
 ### Cloud / deployment
 
