@@ -71,6 +71,15 @@ const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
 
 const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 
+// Determinism: CPUID bits to clear so the guest cannot use nondeterministic
+// hardware sources. These are cleared unconditionally (not just for TDX).
+const RDRAND_ECX_BIT: u8 = 30; // leaf 0x1 ECX: RDRAND instruction
+const RDSEED_EBX_BIT: u8 = 18; // leaf 0x7 EBX: RDSEED instruction
+// KVM paravirt clock bits on leaf 0x4000_0001 EAX
+const KVM_CLOCKSOURCE_BIT: u8 = 0;  // KVM_FEATURE_CLOCKSOURCE
+const KVM_CLOCKSOURCE2_BIT: u8 = 3; // KVM_FEATURE_CLOCKSOURCE2
+const KVM_CLOCKSOURCE_STABLE_BIT: u8 = 24; // KVM_FEATURE_CLOCKSOURCE_STABLE_BIT
+
 pub const _NSIG: i32 = 65;
 
 #[derive(Debug, Copy, Clone)]
@@ -643,12 +652,21 @@ pub fn generate_common_cpuid(
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
         match entry.function {
-            // Clear AMX related bits if the AMX feature is not enabled
-            0x7 if !config.amx => {
+            // Determinism: clear RDRAND (ECX bit 30) on leaf 0x1
+            0x1 => {
+                entry.ecx &= !(1u32 << RDRAND_ECX_BIT);
+            }
+            // Determinism: clear RDSEED (EBX bit 18) on leaf 0x7 index 0,
+            // and clear AMX-related bits if AMX is not enabled
+            0x7 => {
                 if entry.index == 0 {
-                    entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+                    // Always clear RDSEED for determinism
+                    entry.ebx &= !(1u32 << RDSEED_EBX_BIT);
+                    if !config.amx {
+                        entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+                    }
                 }
-                if entry.index == 1 {
+                if entry.index == 1 && !config.amx {
                     entry.eax &= !(1 << AMX_FP16);
                     entry.edx &= !(1 << AMX_COMPLEX);
                 }
@@ -723,10 +741,21 @@ pub fn generate_common_cpuid(
             0x8000_0008 => {
                 entry.eax = (entry.eax & 0xffff_ff00) | (config.phys_bits as u32 & 0xff);
             }
+            // Determinism: clear invariant TSC bit so guest doesn't trust the TSC
+            0x8000_0007 => {
+                entry.edx &= !(1u32 << INVARIANT_TSC_EDX_BIT);
+            }
             0x4000_0001 => {
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
                 // device interrupts to cpus with APIC IDs > 254 without interrupt remapping.
                 entry.eax |= 1 << KVM_FEATURE_MSI_EXT_DEST_ID;
+
+                // Determinism: disable KVM paravirt clocksource so the guest
+                // cannot use kvmclock (which reads a shared memory page with
+                // real host time). Guest will fall back to ACPI PM timer.
+                entry.eax &= !((1u32 << KVM_CLOCKSOURCE_BIT)
+                    | (1u32 << KVM_CLOCKSOURCE2_BIT)
+                    | (1u32 << KVM_CLOCKSOURCE_STABLE_BIT));
 
                 // These features are not supported by TDX
                 #[cfg(feature = "tdx")]
