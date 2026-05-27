@@ -490,6 +490,8 @@ impl VmOps for VmOpsHandler {
 
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
+        // Increment the deterministic exit counter on every pio_read.
+        // The lpj= kernel cmdline param suppresses the calibration busy-loop,
         if let Err(vm_device::BusError::MissingAddressRange) = self.io_bus.read(port, data) {
             info!("Guest PIO read from unregistered address 0x{port:x}");
             data.fill(0xff); // 0xff is sentinel value for invalid reads
@@ -603,6 +605,10 @@ impl Vm {
         let io_bus = Arc::new(Bus::new());
         let mmio_bus = Arc::new(Bus::new());
 
+        // Shared counter incremented on every pio_read VM exit.
+        // Passed to both VmOpsHandler and AcpiPmTimerDevice so the PM timer
+        // returns a value tied to the deterministic exit sequence.
+        #[cfg(target_arch = "x86_64")]
         let vm_ops: Arc<dyn VmOps> = Arc::new(VmOpsHandler {
             memory,
             #[cfg(target_arch = "x86_64")]

@@ -1153,6 +1153,7 @@ pub struct DeviceManager {
     #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
+
 }
 
 /// Create per-PCI-segment MMIO allocators over the range `[start, end]`.

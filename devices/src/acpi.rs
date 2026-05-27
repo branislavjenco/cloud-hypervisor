@@ -219,9 +219,17 @@ impl Aml for AcpiGedDevice {
 
 pub struct AcpiPmTimerDevice {
     /// Deterministic counter: increments by a fixed number of PM-timer ticks
-    /// per read. Real PM timer runs at 3,579,545 Hz. We advance by 1000 ticks
-    /// per read (~280µs of virtual time), which is a plausible polling interval
-    /// and keeps the guest clock ticking forward without any real-time source.
+    /// per read. Real PM timer runs at 3,579,545 Hz. We advance by 1 tick
+    /// per read (~0.28 µs of virtual time), which is small enough that the
+    /// kernel's calibration loops (which busy-poll the timer expecting real-time
+    /// to pass between reads) converge correctly.
+    ///
+    /// Limitation: the uptime value printed by /proc/uptime is driven by how
+    /// many PM timer reads happen before the workload runs.  Those reads are
+    /// triggered by LAPIC timer interrupts (real wall-clock), so uptime varies
+    /// by ~10 ms between runs.  This is a known gap for Step 3; it will be
+    /// resolved in Step 4 when LAPIC ticks are tied to the deterministic
+    /// vCPU scheduler.
     counter: u32,
 }
 
