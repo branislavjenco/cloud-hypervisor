@@ -1080,6 +1080,10 @@ pub struct VmConfig {
     pub landlock_rules: Option<Box<[LandlockConfig]>>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<IvshmemConfig>,
+    /// Seed for the deterministic vCPU scheduler (Step 4+).
+    /// None means nondeterministic (default). Same seed → same execution.
+    #[serde(default)]
+    pub det_seed: Option<u64>,
 }
 
 impl VmConfig {

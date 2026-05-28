@@ -493,6 +493,7 @@ pub struct VmParams<'a> {
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<&'a str>,
+    pub det_seed: Option<u64>,
 }
 
 impl<'a> VmParams<'a> {
@@ -569,6 +570,9 @@ impl<'a> VmParams<'a> {
             args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
         #[cfg(feature = "ivshmem")]
         let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        let det_seed: Option<u64> = args
+            .get_one::<String>("det-seed")
+            .and_then(|s| s.parse().ok());
         VmParams {
             cpus,
             memory,
@@ -614,6 +618,7 @@ impl<'a> VmParams<'a> {
             fw_cfg_config,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            det_seed,
         }
     }
 }
@@ -3521,6 +3526,7 @@ impl VmConfig {
             landlock_rules,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            det_seed: vm_params.det_seed,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
@@ -4905,6 +4911,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            det_seed: None,
         };
 
         let valid_config = RestoreConfig {
@@ -5125,6 +5132,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            det_seed: None,
         };
 
         valid_config.validate().unwrap();

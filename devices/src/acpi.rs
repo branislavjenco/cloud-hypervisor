@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -218,30 +218,29 @@ impl Aml for AcpiGedDevice {
 }
 
 pub struct AcpiPmTimerDevice {
-    /// Deterministic counter: increments by a fixed number of PM-timer ticks
-    /// per read. Real PM timer runs at 3,579,545 Hz. We advance by 1 tick
-    /// per read (~0.28 µs of virtual time), which is small enough that the
-    /// kernel's calibration loops (which busy-poll the timer expecting real-time
-    /// to pass between reads) converge correctly.
+    /// Virtual clock shared with the vCPU run loop.  Incremented by 1 on
+    /// every VM exit.  The PM timer exposes the low 32 bits of this counter
+    /// to the guest so that virtual time tracks the exit sequence rather than
+    /// real wall-clock time.
     ///
-    /// Limitation: the uptime value printed by /proc/uptime is driven by how
-    /// many PM timer reads happen before the workload runs.  Those reads are
-    /// triggered by LAPIC timer interrupts (real wall-clock), so uptime varies
-    /// by ~10 ms between runs.  This is a known gap for Step 3; it will be
-    /// resolved in Step 4 when LAPIC ticks are tied to the deterministic
-    /// vCPU scheduler.
-    counter: u32,
+    /// The real ACPI PM timer runs at 3,579,545 Hz (one tick ≈ 0.28 µs).
+    /// With this model 1 tick = 1 VM exit, so the effective rate depends on
+    /// how many exits per second the guest generates.  The kernel's
+    /// calibration loops busy-poll the timer until it advances; since we
+    /// advance only on exits, calibration effectively counts exits rather
+    /// than real time — which is exactly what we want for determinism.
+    virtual_clock: Arc<AtomicU64>,
 }
 
 impl AcpiPmTimerDevice {
-    pub fn new() -> Self {
-        Self { counter: 0 }
+    pub fn new(virtual_clock: Arc<AtomicU64>) -> Self {
+        Self { virtual_clock }
     }
 }
 
 impl Default for AcpiPmTimerDevice {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(AtomicU64::new(0)))
     }
 }
 
@@ -251,16 +250,10 @@ impl BusDevice for AcpiPmTimerDevice {
             warn!("Invalid sized read of PM timer: {}", data.len());
             return;
         }
-        // Advance by a fixed amount each read so the guest always sees a
-        // monotonically increasing, deterministic clock.
-        // 1 tick per read keeps increments small enough that the kernel's
-        // calibration loops (which busy-poll the timer expecting real-time
-        // to pass between reads) converge correctly. With a large increment
-        // the kernel miscomputes loops_per_jiffy and delay functions break.
-        const TICKS_PER_READ: u32 = 1;
-        self.counter = self.counter.wrapping_add(TICKS_PER_READ);
-        // The ACPI PM timer is 24-bit on most systems (bit 23 is the MSB).
-        // Mask to 32 bits; the kernel handles wrap-around correctly.
-        data.copy_from_slice(&self.counter.to_le_bytes());
+        // Read the shared virtual clock and expose the low 32 bits.
+        // The ACPI PM timer is 24-bit on most systems; the kernel handles
+        // wrap-around correctly for both 24- and 32-bit widths.
+        let ticks = self.virtual_clock.load(Ordering::Relaxed) as u32;
+        data.copy_from_slice(&ticks.to_le_bytes());
     }
 }

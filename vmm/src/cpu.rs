@@ -17,7 +17,7 @@ use std::io::Write;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result, thread};
 
@@ -736,6 +736,13 @@ pub struct CpuManager {
     core_scheduling_group_leader: Arc<AtomicI32>,
     #[cfg(feature = "igvm")]
     igvm_enabled: bool,
+    /// Seed for the deterministic vCPU scheduler. None = nondeterministic.
+    det_seed: Option<u64>,
+    /// Monotonically increasing virtual clock, incremented after every
+    /// KVM_RUN call (one tick per VM exit). Shared with AcpiPmTimerDevice
+    /// so the PM timer tracks virtual time rather than real wall-clock time.
+    #[cfg(target_arch = "x86_64")]
+    pub virtual_clock: Arc<AtomicU64>,
 }
 
 /// State of the core scheduling group leader election for VM-wide cookie
@@ -866,6 +873,8 @@ impl CpuManager {
         numa_nodes: &NumaNodes,
         #[cfg(feature = "sev_snp")] sev_snp_enabled: bool,
         #[cfg(feature = "igvm")] igvm_enabled: bool,
+        det_seed: Option<u64>,
+        #[cfg(target_arch = "x86_64")] virtual_clock: Arc<AtomicU64>,
     ) -> Result<Arc<Mutex<CpuManager>>> {
         if config.max_vcpus > hypervisor.get_max_vcpus() {
             return Err(Error::MaximumVcpusExceeded(
@@ -944,7 +953,21 @@ impl CpuManager {
             )),
             #[cfg(feature = "igvm")]
             igvm_enabled,
+            det_seed,
+            #[cfg(target_arch = "x86_64")]
+            virtual_clock,
         })))
+    }
+
+    /// Returns the seed used for the deterministic scheduler, if set.
+    pub fn det_seed(&self) -> Option<u64> {
+        self.det_seed
+    }
+
+    /// Returns the virtual clock shared with the PM timer device.
+    #[cfg(target_arch = "x86_64")]
+    pub fn virtual_clock(&self) -> Arc<AtomicU64> {
+        self.virtual_clock.clone()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1187,6 +1210,9 @@ impl CpuManager {
 
         let core_scheduling = self.config.core_scheduling;
         let core_scheduling_group_leader = self.core_scheduling_group_leader.clone();
+        #[cfg(target_arch = "x86_64")]
+        let virtual_clock = self.virtual_clock.clone();
+        let det_seed = self.det_seed;
 
         // Retrieve seccomp filter for vcpu thread
         let vcpu_seccomp_filter = get_seccomp_filter(
@@ -1374,6 +1400,26 @@ impl CpuManager {
                             }
 
                             let mut vcpu = vcpu.lock().unwrap();
+
+                            // --- Deterministic prerequisites (Step 4) ---
+                            // Set the guest TSC to our virtual clock so that
+                            // RDTSC (used by spinlocks, Go runtime, etc.) sees
+                            // a deterministic value instead of real wall-clock
+                            // time.  We do this unconditionally when det_seed
+                            // is set; it is a no-op otherwise.
+                            #[cfg(target_arch = "x86_64")]
+                            if det_seed.is_some() {
+                                let ticks = virtual_clock.load(Ordering::Relaxed);
+                                // 0x10 = MSR_IA32_TSC
+                                let msr = hypervisor::arch::x86::MsrEntry {
+                                    index: 0x10,
+                                    data: ticks,
+                                };
+                                if let Err(e) = vcpu.vcpu.set_msrs(&[msr]) {
+                                    warn!("Failed to set MSR_IA32_TSC: {e}");
+                                }
+                            }
+
                             // vcpu.run() returns false on a triple-fault so trigger a reset
                             match vcpu.run() {
                                 Ok(run) => match run {
@@ -1434,6 +1480,12 @@ impl CpuManager {
                                     break;
                                 }
                             }
+
+                            // Advance the virtual clock by one tick per VM
+                            // exit. The PM timer and (when det_seed is set)
+                            // the per-vCPU TSC both read from this counter.
+                            #[cfg(target_arch = "x86_64")]
+                            virtual_clock.fetch_add(1, Ordering::Relaxed);
 
                             // We've been told to terminate
                             if vcpus_kill_signalled.load(Ordering::SeqCst)

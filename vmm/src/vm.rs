@@ -783,6 +783,9 @@ impl Vm {
             .is_some();
 
         let cpus_config = config.lock().unwrap().cpus.clone();
+        let det_seed = config.lock().unwrap().det_seed;
+        #[cfg(target_arch = "x86_64")]
+        let virtual_clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cpu_manager = cpu::CpuManager::new(
             &cpus_config,
             vm,
@@ -800,6 +803,9 @@ impl Vm {
             sev_snp_enabled,
             #[cfg(feature = "igvm")]
             igvm_enabled,
+            det_seed,
+            #[cfg(target_arch = "x86_64")]
+            virtual_clock,
         )
         .map_err(Error::CpuManager)?;
 

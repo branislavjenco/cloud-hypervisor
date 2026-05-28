@@ -206,6 +206,15 @@ fn get_cli_options_sorted(
             .help("Debug console: off|pty|tty|file=<path>,iobase=<port in hex>")
             .default_value("off,iobase=0xe9")
             .group("vm-config"),
+        Arg::new("det-seed")
+            .long("det-seed")
+            .help(
+                "Seed for the deterministic vCPU scheduler. \
+                 Same seed + same image = same execution. \
+                 Omit for non-deterministic (default) mode.",
+            )
+            .num_args(1)
+            .group("vm-config"),
         Arg::new("device")
             .long("device")
             .help(DeviceConfig::SYNTAX)

@@ -764,12 +764,16 @@ fn vmm_thread_rules(
 
 #[cfg(feature = "kvm")]
 fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    // KVM_SET_MSRS is used to write MSR_IA32_TSC before each KVM_RUN when
+    // the deterministic scheduler is active (--det-seed).
+    const KVM_SET_MSRS: u64 = 0x4008_ae89;
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MSRS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
         and![Cond::new(
             1,

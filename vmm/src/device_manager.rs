@@ -1996,7 +1996,13 @@ impl DeviceManager {
         self.bus_devices
             .push(Arc::clone(&ged_device) as Arc<dyn BusDeviceSync>);
 
-        let pm_timer_device = Arc::new(Mutex::new(devices::AcpiPmTimerDevice::new()));
+        #[cfg(target_arch = "x86_64")]
+        let pm_timer_virtual_clock = self.cpu_manager.lock().unwrap().virtual_clock();
+        #[cfg(not(target_arch = "x86_64"))]
+        let pm_timer_virtual_clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pm_timer_device = Arc::new(Mutex::new(devices::AcpiPmTimerDevice::new(
+            pm_timer_virtual_clock,
+        )));
 
         self.bus_devices
             .push(Arc::clone(&pm_timer_device) as Arc<dyn BusDeviceSync>);
