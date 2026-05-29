@@ -2038,6 +2038,17 @@ impl DeviceManager {
             .unwrap()
             .vcpus_kill_signalled()
             .clone();
+        // Add PIT counter-2 emulator (ports 0x40-0x43).
+        // This makes Linux's quick_pit_calibrate() succeed in a handful of
+        // iterations instead of spinning 50,000 times on unregistered port 0x42.
+        let pit = Arc::new(Mutex::new(devices::legacy::Pit::new()));
+        self.bus_devices
+            .push(Arc::clone(&pit) as Arc<dyn BusDeviceSync>);
+        self.address_manager
+            .io_bus
+            .insert(pit, 0x40, 0x4)
+            .map_err(DeviceManagerError::BusError)?;
+
         // Add a shutdown device (i8042)
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
             reset_evt.try_clone().unwrap(),

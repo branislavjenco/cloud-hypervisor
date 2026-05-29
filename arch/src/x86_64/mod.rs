@@ -75,6 +75,17 @@ const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 // hardware sources. These are cleared unconditionally (not just for TDX).
 const RDRAND_ECX_BIT: u8 = 30; // leaf 0x1 ECX: RDRAND instruction
 const RDSEED_EBX_BIT: u8 = 18; // leaf 0x7 EBX: RDSEED instruction
+
+// Deterministic synthetic CPU frequency exposed to the guest. Linux uses
+// CPUID leaf 0x15 to calibrate the TSC and leaf 0x16 to calibrate the CPU
+// before falling back to PIT loops. Those PIT paths poll port 0x61 OUT2
+// forever because Cloud Hypervisor does not emulate PIT counter 2 terminal
+// count.
+const DET_TSC_CRYSTAL_HZ: u32 = 24_000_000;
+const DET_TSC_NUMERATOR: u32 = 100;
+const DET_TSC_DENOMINATOR: u32 = 1;
+const DET_TSC_BASE_MHZ: u32 = 2400;
+
 // KVM paravirt clock bits on leaf 0x4000_0001 EAX
 const KVM_CLOCKSOURCE_BIT: u8 = 0;  // KVM_FEATURE_CLOCKSOURCE
 const KVM_CLOCKSOURCE2_BIT: u8 = 3; // KVM_FEATURE_CLOCKSOURCE2
@@ -770,6 +781,46 @@ pub fn generate_common_cpuid(
             }
             _ => {}
         }
+    }
+
+    // Expose deterministic CPU/TSC frequency leaves. Linux checks leaf
+    // 0x15 in native_calibrate_tsc() and leaf 0x16 in cpu_khz_from_cpuid()
+    // before falling back to PIT calibration. Returning non-zero values lets
+    // deterministic SMP boot skip the early pit_calibrate_tsc() path, which
+    // polls port 0x61 OUT2 before LAPIC timer injection can be delivered.
+    if let Some(entry) = cpuid.iter_mut().find(|c| c.function == 0x15) {
+        entry.eax = DET_TSC_DENOMINATOR;
+        entry.ebx = DET_TSC_NUMERATOR;
+        entry.ecx = DET_TSC_CRYSTAL_HZ;
+        entry.edx = 0;
+    } else {
+        cpuid.push(CpuIdEntry {
+            function: 0x15,
+            eax: DET_TSC_DENOMINATOR,
+            ebx: DET_TSC_NUMERATOR,
+            ecx: DET_TSC_CRYSTAL_HZ,
+            ..Default::default()
+        });
+    }
+
+    if let Some(entry) = cpuid.iter_mut().find(|c| c.function == 0x16) {
+        entry.eax = DET_TSC_BASE_MHZ;
+        entry.ebx = DET_TSC_BASE_MHZ;
+        entry.ecx = 100;
+        entry.edx = 0;
+    } else {
+        cpuid.push(CpuIdEntry {
+            function: 0x16,
+            eax: DET_TSC_BASE_MHZ,
+            ebx: DET_TSC_BASE_MHZ,
+            ecx: 100,
+            ..Default::default()
+        });
+    }
+
+    // Ensure the guest-visible basic CPUID maximum includes both leaves.
+    if let Some(entry) = cpuid.iter_mut().find(|c| c.function == 0x0) {
+        entry.eax = entry.eax.max(0x16);
     }
 
     // Copy CPU identification string

@@ -356,6 +356,7 @@ pub enum VmExit {
     Ignore,
     Reset,
     Shutdown,
+    Hlt,
     Hyperv,
     #[cfg(feature = "tdx")]
     Tdx,
@@ -621,6 +622,13 @@ pub trait Vcpu: Send + Sync {
     ///
     #[cfg(target_arch = "aarch64")]
     fn set_gic_redistributor_addr(&self, _gicr_base_addr: u64) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Inject an external interrupt vector on the next vCPU entry.
+    ///
+    fn interrupt(&self, _vector: u8) -> Result<()> {
         Ok(())
     }
     #[cfg(target_arch = "x86_64")]

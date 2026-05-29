@@ -774,6 +774,10 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
     // KVM_GET_MP_STATE: used by det-sched to skip vCPUs in UNINITIALIZED/HALTED
     // state instead of blocking indefinitely in KVM_RUN.
     const KVM_GET_MP_STATE: u64 = 0x8004_ae98;
+    // KVM_GET/SET_VCPU_EVENTS: used by det-sched to inject a pending interrupt
+    // vector when LAPIC IRR-only injection is insufficient.
+    const KVM_GET_VCPU_EVENTS: u64 = 0x8040_ae9f;
+    const KVM_SET_VCPU_EVENTS: u64 = 0x4040_aea0;
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
@@ -783,6 +787,8 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_LAPIC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_LAPIC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MP_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_VCPU_EVENTS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_VCPU_EVENTS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MSRS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
         and![Cond::new(

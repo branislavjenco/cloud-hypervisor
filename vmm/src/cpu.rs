@@ -1445,6 +1445,7 @@ impl CpuManager {
                                         }
                                     }
                                     VmExit::Ignore => {}
+                                    VmExit::Hlt => {}
                                     VmExit::Hyperv => {}
                                     VmExit::Reset => {
                                         info!("VmExit::Reset");
@@ -1695,6 +1696,14 @@ impl CpuManager {
                 // shuffled each round by the PRNG.
                 let mut order: Vec<usize> = (0..vcpu_count).collect();
 
+                // Step 4d: per-vCPU halted/idle state.
+                // When a vCPU exits with VmExit::Hlt we mark it idle and skip
+                // its slice for the rest of this round.  When all vCPUs are
+                // idle simultaneously we fast-forward the virtual clock to the
+                // next timer tick and let the injection deliver the interrupt
+                // that wakes them.  Any non-Hlt exit clears the idle flag.
+                let mut halted = vec![false; vcpu_count];
+
                 // Deterministic virtual-time timer injection (Step 4c).
                 //
                 // Every TIMER_INTERVAL_EXITS virtual-clock ticks (= VM exits),
@@ -1852,6 +1861,7 @@ impl CpuManager {
                                         ic.lock().unwrap().end_of_interrupt(vector);
                                     }
                                     // Deterministic exit: count + advance clock.
+                                    halted[vcpu_idx] = false;
                                     det_exits += 1;
                                     virtual_clock.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -1879,21 +1889,34 @@ impl CpuManager {
                                     // don't stall forever.  No wall-clock
                                     // preemption is active, so every Ignore
                                     // exit is guest-driven and deterministic.
+                                    halted[vcpu_idx] = false;
                                     det_exits += 1;
                                     virtual_clock.fetch_add(1, Ordering::Relaxed);
                                 }
+                                Ok(VmExit::Hlt) => {
+                                    // Guest is idle (HLT).  Mark this vCPU
+                                    // halted and stop its slice — no point
+                                    // running it again until a timer interrupt
+                                    // wakes it.
+                                    halted[vcpu_idx] = true;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                    break; // end slice for this vCPU
+                                }
                                 Ok(VmExit::Debug) => {
                                     info!("[det-sched] VmExit::Debug");
+                                    halted[vcpu_idx] = false;
                                     det_exits += 1;
                                     virtual_clock.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Ok(VmExit::Hyperv) => {
                                     info!("[det-sched] VmExit::Hyperv");
+                                    halted[vcpu_idx] = false;
                                     det_exits += 1;
                                     virtual_clock.fetch_add(1, Ordering::Relaxed);
                                 }
                                 #[cfg(feature = "tdx")]
                                 Ok(VmExit::Tdx) => {
+                                    halted[vcpu_idx] = false;
                                     det_exits += 1;
                                     virtual_clock.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -1913,6 +1936,44 @@ impl CpuManager {
 
                         } // end slice (inner while)
                     } // end per-vCPU round
+
+                    // Step 4d: all-idle fast-forward.
+                    //
+                    // If every vCPU is halted or UNINITIALIZED (none can make
+                    // forward progress without an interrupt), jump the virtual
+                    // clock to the next timer tick.  The injection path then
+                    // fires on the very next scheduling round.
+                    //
+                    // UNINITIALIZED vCPUs don't block progress: once the BSP
+                    // sends SIPI they become RUNNABLE; we treat them as idle
+                    // here so a solo-halted BSP still triggers the fast-forward.
+                    #[cfg(feature = "kvm")]
+                    {
+                        use hypervisor::kvm::kvm_bindings::{
+                            KVM_MP_STATE_UNINITIALIZED, KVM_MP_STATE_HALTED,
+                        };
+                        let all_idle = vcpus.iter().enumerate().all(|(i, vcpu_mutex)| {
+                            if halted[i] {
+                                return true;
+                            }
+                            // Check KVM MP state for vCPUs not marked halted.
+                            if let Ok(vcpu_guard) = vcpu_mutex.try_lock() {
+                                if let Ok(hypervisor::MpState::Kvm(s)) =
+                                    vcpu_guard.vcpu.get_mp_state()
+                                {
+                                    return s.mp_state == KVM_MP_STATE_UNINITIALIZED
+                                        || s.mp_state == KVM_MP_STATE_HALTED;
+                                }
+                            }
+                            false
+                        });
+                        if all_idle && !vcpus.is_empty() {
+                            let ticks = virtual_clock.load(Ordering::Relaxed);
+                            if ticks < next_timer_tick {
+                                virtual_clock.store(next_timer_tick, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 } // end 'outer
 
                 info!("[det-sched] Scheduler thread exiting");

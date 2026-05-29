@@ -2431,11 +2431,9 @@ impl cpu::Vcpu for KvmVcpu {
                     error!("Guest likely triple-faulted");
                     Ok(cpu::VmExit::Reset)
                 }
-                // Practically unlikely, as KVM emulates the LAPIC and therefore HLT
                 VcpuExit::Hlt => {
                     info!("[vmexit] vcpu={} Hlt", self.vcpu_id);
-                    error!("Received a HLT exit but KVM should handle this in kernel space");
-                    Ok(cpu::VmExit::Reset)
+                    Ok(cpu::VmExit::Hlt)
                 }
 
                 #[cfg(target_arch = "aarch64")]
@@ -3453,6 +3451,24 @@ impl cpu::Vcpu for KvmVcpu {
             }
             Ok(_) => Ok(()),
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Inject an external interrupt vector on the next vCPU entry.
+    ///
+    fn interrupt(&self, vector: u8) -> cpu::Result<()> {
+        let mut events = self
+            .fd
+            .get_vcpu_events()
+            .map_err(|e| cpu::HypervisorCpuError::GetVcpuEvents(e.into()))?;
+        events.interrupt.injected = 1;
+        events.interrupt.nr = vector;
+        events.interrupt.soft = 0;
+        events.interrupt.shadow = 0;
+        self.fd
+            .set_vcpu_events(&events)
+            .map_err(|e| cpu::HypervisorCpuError::SetVcpuEvents(e.into()))
     }
 
     #[cfg(target_arch = "x86_64")]
