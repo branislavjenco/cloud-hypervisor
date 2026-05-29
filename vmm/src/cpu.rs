@@ -1695,6 +1695,39 @@ impl CpuManager {
                 // shuffled each round by the PRNG.
                 let mut order: Vec<usize> = (0..vcpu_count).collect();
 
+                // Deterministic virtual-time timer injection (Step 4c).
+                //
+                // Every TIMER_INTERVAL_EXITS virtual-clock ticks (= VM exits),
+                // we inject a LAPIC timer interrupt (LOCAL_TIMER_VECTOR = 0xec)
+                // into the next vCPU that is about to run.  This is done by:
+                //   1. get_lapic() to read the current in-kernel LAPIC state.
+                //   2. Set the IRR bit for vector 0xec in the LAPIC state.
+                //   3. set_lapic() to write it back; KVM delivers the interrupt
+                //      to the guest at the next KVM_RUN entry.
+                //
+                // This single primitive:
+                //   (a) Makes jiffies / uptime deterministic (no more wall-clock
+                //       LAPIC timer; the in-kernel timer is disabled below).
+                //   (b) Gives calibrate_delay_loop() a deterministic termination
+                //       (jiffies now advance, replacing the lpj= scaffolding).
+                //   (c) Provides deterministic preemption of HLT/idle vCPUs
+                //       (the injected interrupt wakes the halted vCPU).
+                //
+                // The interval K is a tuning knob: smaller = more frequent
+                // timer ticks (finer jiffies resolution, more overhead).
+                // 250 exits ≈ one jiffy with our boot workload exit rate.
+                const TIMER_INTERVAL_EXITS: u64 = 250;
+                // The virtual-clock value at which to fire the next timer.
+                let mut next_timer_tick: u64 = TIMER_INTERVAL_EXITS;
+                // IRR offset and bit for LOCAL_TIMER_VECTOR (0xec = 236):
+                //   IRR base = 0x200, stride = 0x10 per 32 vectors.
+                //   Word index = 0xec / 32 = 7.  Byte offset = 0x200 + 7*0x10 = 0x270.
+                //   Bit within word = 0xec % 32 = 12.
+                const TIMER_IRR_OFFSET: usize = arch::x86_64::interrupts::APIC_IRR_BASE
+                    + (arch::x86_64::interrupts::LOCAL_TIMER_VECTOR as usize / 32) * 0x10;
+                const TIMER_IRR_BIT: u32 =
+                    arch::x86_64::interrupts::LOCAL_TIMER_VECTOR as u32 % 32;
+
                 'outer: loop {
                     // --- Pause handling ---
                     if vcpus_pause_signalled.load(Ordering::SeqCst) {
@@ -1752,8 +1785,56 @@ impl CpuManager {
 
                             let mut vcpu = vcpus[vcpu_idx].lock().unwrap();
 
+                            // Skip vCPUs that are not yet runnable (UNINITIALIZED /
+                            // WAIT_FOR_SIPI).  KVM_RUN would block indefinitely on
+                            // them because the AP won't execute until it receives an
+                            // INIT-SIPI-SIPI from the BSP.  Once the BSP sends SIPI,
+                            // the MP state transitions to RUNNABLE automatically.
+                            #[cfg(feature = "kvm")]
+                            {
+                                use hypervisor::kvm::kvm_bindings::KVM_MP_STATE_UNINITIALIZED;
+                                if let Ok(hypervisor::MpState::Kvm(s)) =
+                                    vcpu.vcpu.get_mp_state()
+                                {
+                                    if s.mp_state == KVM_MP_STATE_UNINITIALIZED {
+                                        drop(vcpu);
+                                        // Count as a slot so we don't spin here,
+                                        // but don't advance virtual_clock (no work done).
+                                        det_exits += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Write TSC = virtual clock for deterministic RDTSC.
                             let ticks = virtual_clock.load(Ordering::Relaxed);
+
+                            // Step 4c: inject a LAPIC timer interrupt when the
+                            // virtual clock crosses the next scheduled tick.
+                            // This makes jiffies deterministic and unblocks SMP boot.
+                            if ticks >= next_timer_tick {
+                                match vcpu.vcpu.get_lapic() {
+                                    Ok(mut lapic) => {
+                                        let irr_word = lapic.get_klapic_reg(TIMER_IRR_OFFSET);
+                                        lapic.set_klapic_reg(
+                                            TIMER_IRR_OFFSET,
+                                            irr_word | (1u32 << TIMER_IRR_BIT),
+                                        );
+                                        if let Err(e) = vcpu.vcpu.set_lapic(&lapic) {
+                                            warn!(
+                                                "[det-sched] set_lapic vcpu={vcpu_idx}: {e}"
+                                            );
+                                        } else {
+                                            next_timer_tick += TIMER_INTERVAL_EXITS;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[det-sched] get_lapic vcpu={vcpu_idx}: {e}"
+                                        );
+                                    }
+                                }
+                            }
                             if let Err(e) = vcpu.vcpu.set_msrs(&[
                                 hypervisor::arch::x86::MsrEntry {
                                     index: 0x10, // MSR_IA32_TSC
@@ -1829,6 +1910,7 @@ impl CpuManager {
                                     break 'outer;
                                 }
                             }
+
                         } // end slice (inner while)
                     } // end per-vCPU round
                 } // end 'outer
