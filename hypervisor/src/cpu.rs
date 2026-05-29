@@ -353,7 +353,11 @@ pub enum HypervisorCpuError {
 pub enum VmExit {
     #[cfg(target_arch = "x86_64")]
     IoapicEoi(u8 /* vector */),
+    /// In-kernel work completed (KVM_EXIT_INTR / EAGAIN): deterministic, count as an exit.
     Ignore,
+    /// KVM_RUN interrupted by a host signal (EINTR): nondeterministic preemption point.
+    /// The det-sched uses this to yield a vCPU slice without advancing virtual_clock.
+    Interrupted,
     Reset,
     Shutdown,
     Hlt,

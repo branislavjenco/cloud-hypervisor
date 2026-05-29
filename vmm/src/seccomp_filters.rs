@@ -764,31 +764,15 @@ fn vmm_thread_rules(
 
 #[cfg(feature = "kvm")]
 fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
-    // KVM_SET_MSRS is used to write MSR_IA32_TSC before each KVM_RUN when
-    // the deterministic scheduler is active (--det-seed).
+    // KVM_SET_MSRS: used to write MSR_IA32_TSC (virtual clock) before each
+    // KVM_RUN for deterministic RDTSC when --det-seed is set.
     const KVM_SET_MSRS: u64 = 0x4008_ae89;
-    // KVM_GET_LAPIC / KVM_SET_LAPIC: used by det-sched timer-injection (Step 4c)
-    // to inject LAPIC timer IRQ before each KVM_RUN.
-    const KVM_GET_LAPIC: u64 = 0x8400_ae8e;
-    const KVM_SET_LAPIC: u64 = 0x4400_ae8f;
-    // KVM_GET_MP_STATE: used by det-sched to skip vCPUs in UNINITIALIZED/HALTED
-    // state instead of blocking indefinitely in KVM_RUN.
-    const KVM_GET_MP_STATE: u64 = 0x8004_ae98;
-    // KVM_GET/SET_VCPU_EVENTS: used by det-sched to inject a pending interrupt
-    // vector when LAPIC IRR-only injection is insufficient.
-    const KVM_GET_VCPU_EVENTS: u64 = 0x8040_ae9f;
-    const KVM_SET_VCPU_EVENTS: u64 = 0x4040_aea0;
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_LAPIC)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_LAPIC)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MP_STATE)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_VCPU_EVENTS)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_VCPU_EVENTS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MSRS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
         and![Cond::new(
@@ -897,7 +881,6 @@ fn vcpu_thread_rules(
     Ok(vec![
         (libc::SYS_brk, vec![]),
         (libc::SYS_clock_gettime, vec![]),
-        (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_close, vec![]),
         (libc::SYS_dup, vec![]),
         (libc::SYS_exit, vec![]),

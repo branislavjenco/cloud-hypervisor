@@ -32,7 +32,7 @@ use anyhow::anyhow;
 #[cfg(feature = "sev_snp")]
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
-use log::{debug, info};
+use log::info;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
 use vmm_sys_util::errno;
@@ -2574,9 +2574,15 @@ impl cpu::Vcpu for KvmVcpu {
             },
 
             Err(ref e) => match e.errno() {
-                libc::EAGAIN | libc::EINTR => {
-                    info!("[vmexit] vcpu={} Interrupted (EAGAIN/EINTR)", self.vcpu_id);
+                libc::EAGAIN => {
+                    // In-kernel work: deterministic, treat as Ignore.
                     Ok(cpu::VmExit::Ignore)
+                }
+                libc::EINTR => {
+                    // Interrupted by host signal (e.g. SIGRTMIN for slice preemption).
+                    // Return Interrupted so callers can yield without advancing virtual_clock.
+                    info!("[vmexit] vcpu={} Interrupted (EINTR)", self.vcpu_id);
+                    Ok(cpu::VmExit::Interrupted)
                 }
                 _ => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                     "VCPU error {e:?}"
