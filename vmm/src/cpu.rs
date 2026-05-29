@@ -1525,13 +1525,23 @@ impl CpuManager {
             return Err(Error::DesiredVCpuCountExceedsMax);
         }
 
-        let vcpu_thread_barrier = Arc::new(Barrier::new(
-            (desired_vcpus - self.present_vcpus() + 1) as usize,
-        ));
-
         if let Some(paused) = paused {
             self.vcpus_pause_signalled.store(paused, Ordering::SeqCst);
         }
+
+        // When a deterministic seed is provided and this is the initial boot
+        // (not hot-plug), drive all vCPUs from a single scheduler thread
+        // instead of spawning one thread per vCPU.  This eliminates host-OS
+        // scheduling nondeterminism: only one vCPU runs at a time, in an order
+        // determined by the seed.
+        #[cfg(target_arch = "x86_64")]
+        if self.det_seed.is_some() && !inserting {
+            return self.start_det_scheduler(desired_vcpus);
+        }
+
+        let vcpu_thread_barrier = Arc::new(Barrier::new(
+            (desired_vcpus - self.present_vcpus() + 1) as usize,
+        ));
 
         info!(
             "Starting vCPUs: desired = {}, allocated = {}, present = {}, paused = {}",
@@ -1549,6 +1559,307 @@ impl CpuManager {
 
         // Unblock all CPU threads.
         vcpu_thread_barrier.wait();
+        Ok(())
+    }
+
+    /// Start a single scheduler thread that drives all vCPUs sequentially.
+    ///
+    /// Used when `--det-seed` is set.  All vCPUs execute on one host thread,
+    /// one at a time, in a deterministic order derived from the seed.  This
+    /// makes guest thread scheduling fully reproducible: same seed → same
+    /// interleaving, every time.
+    ///
+    /// Scheduling algorithm:
+    ///   - Per-round Fisher-Yates shuffle of vCPU order, driven by seeded PRNG.
+    ///   - Each vCPU runs for up to SLICE_EXITS deterministic (non-Ignore) VM
+    ///     exits per turn before the next vCPU gets its turn.
+    ///   - Ignore exits (EINTR, in-kernel work) are transparent: they don't
+    ///     consume the vCPU's quota and don't advance the virtual clock.
+    ///   - A preemption timer thread sends SIGRTMIN to the scheduler every
+    ///     1 ms to force KVM_RUN out of HLT/in-kernel blocking.  This is
+    ///     purely an unblocking mechanism — no scheduling decision depends
+    ///     on wall-clock time.
+    ///   - No wall-clock time enters the scheduling loop.  Scheduling order
+    ///     and slice boundaries depend only on the seed and the deterministic
+    ///     exit sequence, so same seed → same interleaving every time.
+    ///   - On shutdown/reset the thread writes the appropriate event and exits.
+    #[cfg(target_arch = "x86_64")]
+    fn start_det_scheduler(&mut self, desired_vcpus: u32) -> Result<()> {
+        let vcpu_count = desired_vcpus as usize;
+        info!(
+            "[det-sched] Starting deterministic scheduler with {} vCPU(s)",
+            vcpu_count
+        );
+
+        // Collect per-vCPU handles.
+        let vcpus: Vec<Arc<Mutex<Vcpu>>> = (0..vcpu_count)
+            .map(|i| Arc::clone(&self.vcpus[i]))
+            .collect();
+
+        // Shared signals — same ones the per-thread vCPU loop uses.
+        let vcpus_kill_signalled = self.vcpus_kill_signalled.clone();
+        let vcpus_pause_signalled = self.vcpus_pause_signalled.clone();
+        let exit_evt = self.exit_evt.try_clone().unwrap();
+        let reset_evt = self.reset_evt.try_clone().unwrap();
+        let virtual_clock = self.virtual_clock.clone();
+        let det_seed = self.det_seed.unwrap(); // we checked is_some() above
+        let interrupt_controller = self.interrupt_controller.as_ref().cloned();
+
+        // Per-vCPU kill / paused / interrupted flags — so that the existing
+        // pause/resume/shutdown machinery still works.
+        let mut vcpu_states = self.vcpu_states.lock().unwrap();
+        let kill_flags: Vec<Arc<AtomicBool>> = (0..vcpu_count)
+            .map(|i| vcpu_states[i].kill.clone())
+            .collect();
+        let interrupted_flags: Vec<Arc<AtomicBool>> = (0..vcpu_count)
+            .map(|i| vcpu_states[i].vcpu_run_interrupted.clone())
+            .collect();
+        let paused_flags: Vec<Arc<AtomicBool>> = (0..vcpu_count)
+            .map(|i| vcpu_states[i].paused.clone())
+            .collect();
+
+        // Retrieve the seccomp filter once (same filter used by all vCPUs).
+        let vcpu_seccomp_filter = get_seccomp_filter(
+            &self.seccomp_action,
+            Thread::Vcpu,
+            Some(self.hypervisor.hypervisor_type()),
+        )
+        .map_err(Error::CreateSeccompFilter)?;
+
+        let handle = thread::Builder::new()
+            .name("det-sched".to_string())
+            .spawn(move || {
+                // Apply the same seccomp filter that individual vCPU threads use.
+                if !vcpu_seccomp_filter.is_empty() {
+                    if let Err(e) =
+                        apply_filter(&vcpu_seccomp_filter).map_err(Error::ApplySeccompFilter)
+                    {
+                        error!("[det-sched] Failed to apply seccomp filter: {e:?}");
+                        exit_evt.write(1).unwrap();
+                        return;
+                    }
+                }
+
+                // CRITICAL: register the signal handler BEFORE starting the
+                // preempt thread.  Otherwise the first pthread_kill kills us.
+                extern "C" fn handle_signal_det(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
+                register_signal_handler(SIGRTMIN(), handle_signal_det)
+                    .expect("[det-sched] failed to register signal handler");
+
+                // Preemption timer: fires SIGRTMIN every PREEMPT_US µs to
+                // force KVM_RUN out of in-kernel blocking (HLT, AP bringup).
+                const PREEMPT_US: u64 = 5_000; // 5 ms
+                let sched_tid: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                let preempt_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+                {
+                    let sched_tid = sched_tid.clone();
+                    let stop = preempt_stop.clone();
+                    thread::Builder::new()
+                        .name("det-preempt".to_string())
+                        .spawn(move || {
+                            let interval = std::time::Duration::from_micros(PREEMPT_US);
+                            loop {
+                                thread::sleep(interval);
+                                if stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let tid = sched_tid.load(Ordering::Relaxed);
+                                if tid != 0 {
+                                    unsafe {
+                                        libc::pthread_kill(tid as libc::pthread_t, SIGRTMIN());
+                                    }
+                                }
+                            }
+                        })
+                        .expect("[det-sched] failed to spawn preempt thread");
+                }
+
+                // Publish pthread_t so preempt timer can reach us.
+                let my_pt = unsafe { libc::pthread_self() } as u64;
+                sched_tid.store(my_pt, Ordering::Relaxed);
+
+                // xorshift64 PRNG seeded from det_seed.
+                // Drives per-round shuffle of vCPU scheduling order so that
+                // the interleaving is deterministic but varies with the seed.
+                let mut rng_state: u64 = det_seed ^ 0x9e3779b97f4a7c15;
+                if rng_state == 0 {
+                    rng_state = 1;
+                }
+                let mut xorshift64 = move || -> u64 {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    rng_state
+                };
+
+                // Number of deterministic (non-Ignore) VM exits each vCPU
+                // runs per scheduling round before we switch to the next vCPU.
+                //
+                // Ignore exits (EINTR from preempt signal, in-kernel work) are
+                // transparent: they don't count toward the quota and don't
+                // affect the virtual clock.  This means a halted AP that
+                // generates only Ignore exits will spin until preempted, but
+                // the BSP gets its turn when the AP's Ignore exits cause
+                // KVM_RUN to be interrupted by the preempt timer.
+                //
+                // With 32 deterministic exits at ~20k exits/s, each vCPU gets
+                // ~1.6 ms of work per round.  For a 2-vCPU VM this is ~800 Hz
+                // context switch rate — fine for syscall/IO-heavy workloads.
+                const SLICE_EXITS: u32 = 32;
+
+                // Per-round scheduling order — a permutation of 0..vcpu_count
+                // shuffled each round by the PRNG.
+                let mut order: Vec<usize> = (0..vcpu_count).collect();
+
+                'outer: loop {
+                    // --- Pause handling ---
+                    if vcpus_pause_signalled.load(Ordering::SeqCst) {
+                        for i in 0..vcpu_count {
+                            interrupted_flags[i].store(true, Ordering::SeqCst);
+                            paused_flags[i].store(true, Ordering::SeqCst);
+                        }
+                        while vcpus_pause_signalled.load(Ordering::SeqCst) {
+                            thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        for i in 0..vcpu_count {
+                            paused_flags[i].store(false, Ordering::SeqCst);
+                            interrupted_flags[i].store(false, Ordering::SeqCst);
+                        }
+                    }
+
+                    // --- Kill check ---
+                    if vcpus_kill_signalled.load(Ordering::SeqCst) {
+                        for f in &interrupted_flags {
+                            f.store(true, Ordering::SeqCst);
+                        }
+                        break 'outer;
+                    }
+
+                    // --- Shuffle vCPU order for this round (Fisher-Yates) ---
+                    for i in (1..vcpu_count).rev() {
+                        let j = (xorshift64() as usize) % (i + 1);
+                        order.swap(i, j);
+                    }
+
+                    // --- Run each vCPU for SLICE_EXITS deterministic exits ---
+                    for &vcpu_idx in &order {
+                        if kill_flags[vcpu_idx].load(Ordering::SeqCst) {
+                            interrupted_flags[vcpu_idx].store(true, Ordering::SeqCst);
+                            for f in &interrupted_flags {
+                                f.store(true, Ordering::SeqCst);
+                            }
+                            break 'outer;
+                        }
+
+                        let mut det_exits: u32 = 0;
+                        while det_exits < SLICE_EXITS {
+                            // Kill/pause checks inside the slice.
+                            if vcpus_kill_signalled.load(Ordering::SeqCst)
+                                || kill_flags[vcpu_idx].load(Ordering::SeqCst)
+                            {
+                                for f in &interrupted_flags {
+                                    f.store(true, Ordering::SeqCst);
+                                }
+                                break 'outer;
+                            }
+                            if vcpus_pause_signalled.load(Ordering::SeqCst) {
+                                break; // fall through to outer pause handler
+                            }
+
+                            let mut vcpu = vcpus[vcpu_idx].lock().unwrap();
+
+                            // Write TSC = virtual clock for deterministic RDTSC.
+                            let ticks = virtual_clock.load(Ordering::Relaxed);
+                            if let Err(e) = vcpu.vcpu.set_msrs(&[
+                                hypervisor::arch::x86::MsrEntry {
+                                    index: 0x10, // MSR_IA32_TSC
+                                    data: ticks,
+                                },
+                            ]) {
+                                warn!(
+                                    "[det-sched] set MSR_IA32_TSC vcpu={vcpu_idx}: {e}"
+                                );
+                            }
+
+                            match vcpu.run() {
+                                Ok(VmExit::IoapicEoi(vector)) => {
+                                    if let Some(ic) = &interrupt_controller {
+                                        ic.lock().unwrap().end_of_interrupt(vector);
+                                    }
+                                    // Deterministic exit: count + advance clock.
+                                    det_exits += 1;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(VmExit::Reset) => {
+                                    info!("[det-sched] VmExit::Reset");
+                                    for f in &interrupted_flags {
+                                        f.store(true, Ordering::SeqCst);
+                                    }
+                                    drop(vcpu);
+                                    reset_evt.write(1).unwrap();
+                                    break 'outer;
+                                }
+                                Ok(VmExit::Shutdown) => {
+                                    info!("[det-sched] VmExit::Shutdown");
+                                    for f in &interrupted_flags {
+                                        f.store(true, Ordering::SeqCst);
+                                    }
+                                    drop(vcpu);
+                                    exit_evt.write(1).unwrap();
+                                    break 'outer;
+                                }
+                                Ok(VmExit::Ignore) => {
+                                    // In-kernel work (PIT reads, PCI config,
+                                    // etc.).  Count toward slice limit so we
+                                    // don't stall forever.  No wall-clock
+                                    // preemption is active, so every Ignore
+                                    // exit is guest-driven and deterministic.
+                                    det_exits += 1;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(VmExit::Debug) => {
+                                    info!("[det-sched] VmExit::Debug");
+                                    det_exits += 1;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(VmExit::Hyperv) => {
+                                    info!("[det-sched] VmExit::Hyperv");
+                                    det_exits += 1;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                }
+                                #[cfg(feature = "tdx")]
+                                Ok(VmExit::Tdx) => {
+                                    det_exits += 1;
+                                    virtual_clock.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[det-sched] vcpu={vcpu_idx} error: {:?}",
+                                        Error::VcpuRun(e.into())
+                                    );
+                                    for f in &interrupted_flags {
+                                        f.store(true, Ordering::SeqCst);
+                                    }
+                                    drop(vcpu);
+                                    exit_evt.write(1).unwrap();
+                                    break 'outer;
+                                }
+                            }
+                        } // end slice (inner while)
+                    } // end per-vCPU round
+                } // end 'outer
+
+                info!("[det-sched] Scheduler thread exiting");
+            })
+            .map_err(Error::VcpuSpawn)?;
+
+        // Store the thread handle in vcpu_states slot 0.  Shutdown joins it.
+        // (We use slot 0 as the single join point; the other slots are left
+        // with their default handle=None so the existing join/signal loops
+        // skip them cleanly.)
+        vcpu_states[0].handle = Some(handle);
+        drop(vcpu_states);
+
         Ok(())
     }
 
