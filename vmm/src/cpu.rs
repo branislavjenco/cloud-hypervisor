@@ -1736,6 +1736,9 @@ impl CpuManager {
                     + (arch::x86_64::interrupts::LOCAL_TIMER_VECTOR as usize / 32) * 0x10;
                 const TIMER_IRR_BIT: u32 =
                     arch::x86_64::interrupts::LOCAL_TIMER_VECTOR as u32 % 32;
+                // Spurious Vector Register offset and APIC-enable bit (for injection guard).
+                const APIC_SVR: usize = arch::x86_64::interrupts::APIC_SVR;
+                const APIC_SVR_ENABLE_BIT: u32 = arch::x86_64::interrupts::APIC_SVR_ENABLE_BIT;
 
                 'outer: loop {
                     // --- Pause handling ---
@@ -1821,26 +1824,51 @@ impl CpuManager {
                             // Step 4c: inject a LAPIC timer interrupt when the
                             // virtual clock crosses the next scheduled tick.
                             // This makes jiffies deterministic and unblocks SMP boot.
+                            //
+                            // Guard: only inject when the LAPIC is actually enabled
+                            // (SVR bit 8 set).  Before Linux calls setup_local_APIC()
+                            // the LAPIC is masked/disabled and setting IRR bits has no
+                            // effect — the interrupt is silently dropped.  We keep
+                            // advancing next_timer_tick so we do not accumulate a
+                            // backlog of injections and instead attempt one clean
+                            // injection at the next interval after the LAPIC comes up.
                             if ticks >= next_timer_tick {
                                 match vcpu.vcpu.get_lapic() {
                                     Ok(mut lapic) => {
-                                        let irr_word = lapic.get_klapic_reg(TIMER_IRR_OFFSET);
-                                        lapic.set_klapic_reg(
-                                            TIMER_IRR_OFFSET,
-                                            irr_word | (1u32 << TIMER_IRR_BIT),
-                                        );
-                                        if let Err(e) = vcpu.vcpu.set_lapic(&lapic) {
-                                            warn!(
-                                                "[det-sched] set_lapic vcpu={vcpu_idx}: {e}"
+                                        let svr = lapic.get_klapic_reg(APIC_SVR);
+                                        let lapic_enabled =
+                                            (svr >> APIC_SVR_ENABLE_BIT) & 1 == 1;
+                                        if lapic_enabled {
+                                            let irr_word =
+                                                lapic.get_klapic_reg(TIMER_IRR_OFFSET);
+                                            lapic.set_klapic_reg(
+                                                TIMER_IRR_OFFSET,
+                                                irr_word | (1u32 << TIMER_IRR_BIT),
                                             );
-                                        } else {
-                                            next_timer_tick += TIMER_INTERVAL_EXITS;
+                                            if let Err(e) = vcpu.vcpu.set_lapic(&lapic) {
+                                                warn!(
+                                                    "[det-sched] set_lapic vcpu={vcpu_idx}: {e}"
+                                                );
+                                            } else {
+                                                info!(
+                                                    "[det-sched] injected LAPIC timer \
+                                                     vcpu={vcpu_idx} tick={ticks}"
+                                                );
+                                                next_timer_tick += TIMER_INTERVAL_EXITS;
+                                            }
                                         }
+                                        // else: LAPIC not yet enabled — do NOT advance
+                                        // next_timer_tick.  We retry on every subsequent
+                                        // exit until the LAPIC comes up.  The all-idle
+                                        // fast-forward ensures we are not spinning here;
+                                        // the guest is making exits (PIT/PCI) so the
+                                        // virtual clock is still advancing.
                                     }
                                     Err(e) => {
                                         warn!(
                                             "[det-sched] get_lapic vcpu={vcpu_idx}: {e}"
                                         );
+                                        // Don't advance — retry next exit.
                                     }
                                 }
                             }

@@ -17,6 +17,8 @@ pub const APIC_TMICT: usize = 0x380; // Initial Count
 pub const APIC_TMCCT: usize = 0x390; // Current Count
 pub const APIC_TDCR: usize  = 0x3e0; // Divide Config
 pub const APIC_IRR_BASE: usize = 0x200; // IRR[0..7], stride 0x10
+pub const APIC_SVR: usize = 0x0f0;      // Spurious Vector Register; bit 8 = APIC enabled
+pub const APIC_SVR_ENABLE_BIT: u32 = 8;
 pub const APIC_MODE_NMI: u32 = 0x4;
 pub const APIC_MODE_EXTINT: u32 = 0x7;
 // Linux LOCAL_TIMER_VECTOR (arch/x86/include/asm/irq_vectors.h)
