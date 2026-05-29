@@ -1640,43 +1640,30 @@ impl CpuManager {
                     }
                 }
 
-                // CRITICAL: register the signal handler BEFORE starting the
-                // preempt thread.  Otherwise the first pthread_kill kills us.
+                // Register a no-op SIGRTMIN handler. This is NOT used for
+                // preemption (see note below); it exists only so the existing
+                // shutdown/kill machinery (Vcpu::signal_thread -> pthread_kill)
+                // can break this thread's KVM_RUN out cleanly instead of the
+                // default action terminating the whole process. Firing only at
+                // teardown, it has no effect on guest execution determinism.
                 extern "C" fn handle_signal_det(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
                 register_signal_handler(SIGRTMIN(), handle_signal_det)
                     .expect("[det-sched] failed to register signal handler");
 
-                // Preemption timer: fires SIGRTMIN every PREEMPT_US µs to
-                // force KVM_RUN out of in-kernel blocking (HLT, AP bringup).
-                const PREEMPT_US: u64 = 5_000; // 5 ms
-                let sched_tid: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-                let preempt_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-                {
-                    let sched_tid = sched_tid.clone();
-                    let stop = preempt_stop.clone();
-                    thread::Builder::new()
-                        .name("det-preempt".to_string())
-                        .spawn(move || {
-                            let interval = std::time::Duration::from_micros(PREEMPT_US);
-                            loop {
-                                thread::sleep(interval);
-                                if stop.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                let tid = sched_tid.load(Ordering::Relaxed);
-                                if tid != 0 {
-                                    unsafe {
-                                        libc::pthread_kill(tid as libc::pthread_t, SIGRTMIN());
-                                    }
-                                }
-                            }
-                        })
-                        .expect("[det-sched] failed to spawn preempt thread");
-                }
-
-                // Publish pthread_t so preempt timer can reach us.
-                let my_pt = unsafe { libc::pthread_self() } as u64;
-                sched_tid.store(my_pt, Ordering::Relaxed);
+                // NOTE: This scheduler switches vCPUs ONLY at natural VM exits.
+                // There is deliberately no preemption timer, no SIGRTMIN, and no
+                // det-preempt thread: any wall-clock-driven preemption would
+                // reintroduce nondeterminism (the instruction-stream point where
+                // KVM_RUN returns EINTR is wall-clock-dependent, contaminating
+                // both the slice boundaries and the virtual clock).  The earlier
+                // signal-based attempt was reverted for exactly this reason.
+                //
+                // Consequence: a vCPU that never exits (a pure compute loop, or
+                // an AP blocked in-kernel on HLT/bringup) cannot be preempted by
+                // this loop alone.  Deterministic preemption of those cases is
+                // the job of the virtual-time timer-interrupt primitive (Step 4c)
+                // and PMU branch counting (Step 4e).  Until 4c lands, SMP boot
+                // may block; single-vCPU exit-driven workloads run deterministically.
 
                 // xorshift64 PRNG seeded from det_seed.
                 // Drives per-round shuffle of vCPU scheduling order so that
@@ -1692,19 +1679,16 @@ impl CpuManager {
                     rng_state
                 };
 
-                // Number of deterministic (non-Ignore) VM exits each vCPU
-                // runs per scheduling round before we switch to the next vCPU.
+                // Number of VM exits each vCPU runs per scheduling round before
+                // we switch to the next vCPU.
                 //
-                // Ignore exits (EINTR from preempt signal, in-kernel work) are
-                // transparent: they don't count toward the quota and don't
-                // affect the virtual clock.  This means a halted AP that
-                // generates only Ignore exits will spin until preempted, but
-                // the BSP gets its turn when the AP's Ignore exits cause
-                // KVM_RUN to be interrupted by the preempt timer.
-                //
-                // With 32 deterministic exits at ~20k exits/s, each vCPU gets
-                // ~1.6 ms of work per round.  For a 2-vCPU VM this is ~800 Hz
-                // context switch rate — fine for syscall/IO-heavy workloads.
+                // Because there is no wall-clock preemption, EVERY exit (including
+                // VmExit::Ignore: PIT reads, PCI config reads, RTC, etc.) is
+                // guest-driven and therefore deterministic.  We count all of them
+                // toward the quota and advance the virtual clock on all of them.
+                // (Excluding Ignore exits would stall the scheduler forever on the
+                // PIT calibration / schedule_timeout loops, which exit only via
+                // Ignore.)
                 const SLICE_EXITS: u32 = 32;
 
                 // Per-round scheduling order — a permutation of 0..vcpu_count
